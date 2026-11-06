@@ -1,0 +1,9 @@
+{
+  "id": "obgit",
+  "name": "obgit",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "GitHub API 経由でリモートリポジトリとファイル単位に同期します",
+  "author": "riiimparm",
+  "isDesktopOnly": false
+}
