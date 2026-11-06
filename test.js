@@ -7,7 +7,8 @@ Module._load = (req, ...rest) => req === 'obsidian'
       requestUrl: () => {}, arrayBufferToBase64: () => {}, base64ToArrayBuffer: () => {} }
   : load(req, ...rest);
 
-const { decide, blobSha, makeIgnore } = require('./main.js');
+const { decide, blobSha, makeIgnore, writeToken, readToken } = require('./main.js');
+const fs = require('fs'), os = require('os'), nodePath = require('path');
 
 const A = 'aaa', B = 'bbb', C = 'ccc';
 assert.equal(decide(A, A, A), 'none', '一致');
@@ -39,5 +40,21 @@ assert.ok(!makeIgnore(['#*.md'])('a.md'), 'コメント行は無視');
   // git hash-object の既知値
   assert.equal(await blobSha(new TextEncoder().encode('hello\n')), 'ce013625030ba8dba906f756967f9e9ca394464a');
   assert.equal(await blobSha(new Uint8Array(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
+
+  // トークンはファイルに置き、ハッシュが合うものだけ読み戻す
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'obgit-'));
+  const tp = nodePath.join(dir, 'sub', 'token');
+  const hash = await writeToken(tp, 'ghp_secret');
+  assert.equal(await readToken(tp, hash), 'ghp_secret', '書いて読める');
+  assert.equal(fs.statSync(tp).mode & 0o777, 0o600, '所有者しか読めない');
+  fs.writeFileSync(tp, 'ghp_secret\n');
+  assert.equal(await readToken(tp, hash), 'ghp_secret', '末尾の改行は無視');
+  fs.writeFileSync(tp, 'ghp_other');
+  await assert.rejects(() => readToken(tp, hash), /設定時と違います/, 'すり替えは拒否');
+  await assert.rejects(() => readToken(tp, ''), /設定時と違います/, 'ハッシュ未設定も拒否');
+  fs.rmSync(tp);
+  await assert.rejects(() => readToken(tp, hash), /読めません/, 'ファイルが無い');
+  fs.rmSync(dir, { recursive: true });
+
   console.log('ok');
 })();

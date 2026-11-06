@@ -1,5 +1,7 @@
 const { Plugin, PluginSettingTab, Setting, Notice, requestUrl,
         arrayBufferToBase64, base64ToArrayBuffer } = require('obsidian');
+const fs = require('fs');
+const os = require('os');
 
 const CONFLICT_DIR = '_conflict';
 const IGNORE_FILE = '.gitignore';
@@ -8,7 +10,34 @@ const DEFAULT_IGNORE = `# obgit: 同期から除外するパターン (.gitignor
 `;
 
 function hostname() {
-  try { return require('os').hostname(); } catch (e) { return 'obsidian'; }
+  try { return os.hostname(); } catch (e) { return 'obsidian'; }
+}
+
+const TOKEN_PATH = require('path').join(os.homedir(), '.config', 'obgit', 'token');
+
+async function digest(algo, bytes) {
+  const d = await crypto.subtle.digest(algo, bytes);
+  return Array.from(new Uint8Array(d), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// トークンは vault の外のファイルに置き、設定には保存先と SHA-256 だけ残す。
+async function writeToken(p, token) {
+  fs.mkdirSync(require('path').dirname(p), { recursive: true });
+  fs.writeFileSync(p, token, { mode: 0o600 });
+  fs.chmodSync(p, 0o600);  // 既存ファイルを上書きしたときは writeFileSync の mode が効かない
+  return digest('SHA-256', new TextEncoder().encode(token));
+}
+
+// 設定したときと同じ内容だったものだけ返す。無い / すり替えられていれば投げる。
+async function readToken(p, hash) {
+  let token;
+  try { token = fs.readFileSync(p, 'utf8').trim(); } catch (e) {
+    throw new Error(`トークンファイルを読めません: ${p}`);
+  }
+  if (!hash || await digest('SHA-256', new TextEncoder().encode(token)) !== hash) {
+    throw new Error(`トークンファイルの内容が設定時と違います: ${p}`);
+  }
+  return token;
 }
 
 // git の blob SHA を計算する。GitHub の tree API が返す sha と同じ値になるので、
@@ -19,8 +48,7 @@ async function blobSha(data) {
   const buf = new Uint8Array(header.length + bytes.length);
   buf.set(header);
   buf.set(bytes, header.length);
-  const d = await crypto.subtle.digest('SHA-1', buf);
-  return Array.from(new Uint8Array(d), b => b.toString(16).padStart(2, '0')).join('');
+  return digest('SHA-1', buf);
 }
 
 // ls/rs: ローカル/リモートの blob sha (無ければ null)、base: 前回同期時の sha
@@ -69,11 +97,12 @@ function makeIgnore(lines) {
   };
 }
 
-const DEFAULT_SETTINGS = { token: '', repo: '', branch: 'main', device: hostname(), exclude: '', base: {} };
+const DEFAULT_SETTINGS = { tokenPath: TOKEN_PATH, tokenHash: '', repo: '', branch: 'main', device: hostname(), exclude: '', base: {} };
 
 class ObGitPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (this.settings.token) await this.saveToken(this.settings.token);  // 平文で保存されていた分を追い出す
     this.status = this.addStatusBarItem();
     this.status.setText('obgit: 未同期');
     this.addRibbonIcon('refresh-cw', 'GitHub と同期', () => this.sync());
@@ -81,8 +110,15 @@ class ObGitPlugin extends Plugin {
     this.addSettingTab(new ObGitSettingTab(this.app, this));
   }
 
+  async saveToken(token) {
+    this.settings.tokenHash = await writeToken(this.settings.tokenPath, token);
+    delete this.settings.token;
+    await this.saveData(this.settings);
+  }
+
   async api(method, path, body) {
-    const headers = { Authorization: `Bearer ${this.settings.token}`, Accept: 'application/vnd.github+json' };
+    const token = await readToken(this.settings.tokenPath, this.settings.tokenHash);
+    const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' };
     if (body) headers['Content-Type'] = 'application/json';
     const r = await requestUrl({
       url: 'https://api.github.com' + path, method, headers,
@@ -160,8 +196,8 @@ class ObGitPlugin extends Plugin {
 
   async sync() {
     if (this.syncing) return;
-    const { token, repo } = this.settings;
-    if (!token || !repo) { new Notice('obgit: 設定でトークンとリポジトリを指定してください'); return; }
+    const { tokenHash, repo } = this.settings;
+    if (!tokenHash || !repo) { new Notice('obgit: 設定でトークンとリポジトリを指定してください'); return; }
     this.syncing = true;
     this.status.setText('obgit: 同期中…');
     const n = { pull: 0, push: 0, del: 0, conflict: 0 };
@@ -228,20 +264,45 @@ class ObGitPlugin extends Plugin {
 class ObGitSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
-  field(name, desc, key, password) {
+  field(name, desc, key) {
     new Setting(this.containerEl).setName(name).setDesc(desc).addText(t => {
-      if (password) t.inputEl.type = 'password';
       t.setValue(this.plugin.settings[key]).onChange(async v => {
         this.plugin.settings[key] = v.trim();
         await this.plugin.saveData(this.plugin.settings);
       });
-      if (key === 'token' || key === 'repo') t.inputEl.addEventListener('blur', () => this.check());
+      if (key === 'repo' || key === 'tokenPath') t.inputEl.addEventListener('blur', () => this.check());
     });
+  }
+
+  // 入力欄を離れたときに保存先へ書き出す。値は設定にも入力欄にも残さない。
+  tokenField() {
+    const saved = !!this.plugin.settings.tokenHash;
+    new Setting(this.containerEl).setName('GitHub トークン')
+      .setDesc(saved ? '保存済み。入れ直すと保存先のファイルを上書きします'
+                     : 'repo スコープの Personal Access Token。入力欄を離れると保存先へ書き出します')
+      .addText(t => {
+        t.inputEl.type = 'password';
+        t.setPlaceholder(saved ? '********' : '未設定');
+        t.inputEl.addEventListener('blur', async () => {
+          const v = t.getValue().trim();
+          if (!v) return;
+          t.setValue('');
+          try {
+            await this.plugin.saveToken(v);
+            new Notice(`obgit: トークンを ${this.plugin.settings.tokenPath} に保存しました`);
+          } catch (e) {
+            new Notice('obgit: トークンを保存できません — ' + e.message);
+            return;
+          }
+          this.display();
+        });
+      });
   }
 
   display() {
     this.containerEl.empty();
-    this.field('GitHub トークン', 'repo スコープの Personal Access Token。入力欄を離れると疎通確認します', 'token', true);
+    this.tokenField();
+    this.field('トークンの保存先', 'vault の外のパス。ここへ平文で書き出し、設定には SHA-256 だけ残します', 'tokenPath');
     this.field('リポジトリ', 'owner/repo の形式', 'repo');
     this.field('ブランチ', '', 'branch');
     this.field('端末名', 'コミットメッセージに使います', 'device');
@@ -253,12 +314,12 @@ class ObGitSettingTab extends PluginSettingTab {
       }));
     new Setting(this.containerEl).setName('接続確認').addButton(b => b.setButtonText('確認').onClick(() => this.check()));
     this.result = this.containerEl.createDiv({ cls: 'setting-item-description' });
-    if (this.plugin.settings.token && this.plugin.settings.repo) this.check();
+    if (this.plugin.settings.tokenHash && this.plugin.settings.repo) this.check();
   }
 
   async check() {
-    const { token, repo } = this.plugin.settings;
-    if (!token || !repo) { this.result.setText('トークンとリポジトリを入力してください'); this.result.style.color = ''; return; }
+    const { tokenHash, repo } = this.plugin.settings;
+    if (!tokenHash || !repo) { this.result.setText('トークンとリポジトリを入力してください'); this.result.style.color = ''; return; }
     this.result.setText('確認中…');
     try {
       const r = await this.plugin.api('GET', `/repos/${repo}`);
@@ -277,3 +338,5 @@ module.exports = ObGitPlugin;
 module.exports.decide = decide;
 module.exports.blobSha = blobSha;
 module.exports.makeIgnore = makeIgnore;
+module.exports.writeToken = writeToken;
+module.exports.readToken = readToken;
